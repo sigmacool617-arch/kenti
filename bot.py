@@ -1,81 +1,122 @@
-import os, threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import torch, torch.nn as nn
+import os, json, hashlib, threading, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import numpy as np
 from tokenizers import Tokenizer
-import telebot
 
-torch.set_num_threads(1)
-torch.set_grad_enabled(False)
-
-# --- модель (те же размеры, что при обучении) ---
+# --- модель: чистый numpy, без PyTorch (те же размеры, что при обучении) ---
 V, D, L, H, T = 6000, 256, 4, 4, 64
 tok = Tokenizer.from_file("kenti_tokenizer.json")
-emb = nn.Embedding(V, D)
-pos = nn.Embedding(T, D)
-enc = nn.TransformerEncoder(
-    nn.TransformerEncoderLayer(D, H, 4 * D, 0.1, batch_first=True, norm_first=True),
-    L, norm=nn.LayerNorm(D), enable_nested_tensor=False)
-head = nn.Linear(D, V, bias=False)
-head.weight = emb.weight
-
-c = torch.load("kenti_lucky.pt", map_location="cpu")
-emb.load_state_dict(c["emb"])
-pos.load_state_dict(c["pos"])
-enc.load_state_dict(c["enc"])
-enc.eval()
-
-mask = nn.Transformer.generate_square_subsequent_mask(T)
+W = {k: v.astype(np.float32) for k, v in np.load("kenti.npz").items()}
 eos = tok.token_to_id("<eos>")
+rng = np.random.default_rng()
 
 
-def fwd(x):
-    n = x.shape[1]
-    h = emb(x) + pos(torch.arange(n))
-    return head(enc(h, mask=mask[:n, :n], is_causal=True))
+def layer_norm(x, w, b):
+    m = x.mean(-1, keepdims=True)
+    v = x.var(-1, keepdims=True)
+    return (x - m) / np.sqrt(v + 1e-5) * w + b
+
+
+def forward(ids):
+    """Возвращает логиты следующего токена."""
+    n = len(ids)
+    hd = D // H
+    x = W["emb.weight"][ids] + W["pos.weight"][:n]
+    mask = np.triu(np.full((n, n), -1e9, dtype=np.float32), 1)
+    for i in range(L):
+        p = f"enc.layers.{i}."
+        h = layer_norm(x, W[p + "norm1.weight"], W[p + "norm1.bias"])
+        qkv = h @ W[p + "self_attn.in_proj_weight"].T + W[p + "self_attn.in_proj_bias"]
+        q, k, v = np.split(qkv, 3, axis=-1)
+        q = q.reshape(n, H, hd).transpose(1, 0, 2)
+        k = k.reshape(n, H, hd).transpose(1, 0, 2)
+        v = v.reshape(n, H, hd).transpose(1, 0, 2)
+        s = q @ k.transpose(0, 2, 1) / np.sqrt(hd) + mask
+        s = np.exp(s - s.max(-1, keepdims=True))
+        s /= s.sum(-1, keepdims=True)
+        a = (s @ v).transpose(1, 0, 2).reshape(n, D)
+        x = x + a @ W[p + "self_attn.out_proj.weight"].T + W[p + "self_attn.out_proj.bias"]
+        h = layer_norm(x, W[p + "norm2.weight"], W[p + "norm2.bias"])
+        h = np.maximum(h @ W[p + "linear1.weight"].T + W[p + "linear1.bias"], 0)
+        x = x + h @ W[p + "linear2.weight"].T + W[p + "linear2.bias"]
+    x = layer_norm(x[-1], W["enc.norm.weight"], W["enc.norm.bias"])
+    return x @ W["emb.weight"].T
 
 
 def say(q, max_new=30, temp=0.7, k=40):
     start = tok.encode(q.lower().strip() + "<sep>").ids[-40:]
     ids = list(start)
     for _ in range(max_new):
-        lg = fwd(torch.tensor([ids[-T:]]))[0, -1] / temp
-        lg = lg.masked_fill(lg < torch.topk(lg, k).values[-1], -1e9)
-        nxt = torch.multinomial(torch.softmax(lg, -1), 1).item()
+        lg = forward(ids[-T:]) / temp
+        top = np.argpartition(lg, -k)[-k:]
+        p = np.exp(lg[top] - lg[top].max())
+        p /= p.sum()
+        nxt = int(rng.choice(top, p=p))
         if nxt == eos:
             break
         ids.append(nxt)
     return tok.decode(ids[len(start):], skip_special_tokens=True).strip()
 
 
-# --- мини-сервер, чтобы хостинг видел, что сервис жив ---
-class Health(BaseHTTPRequestHandler):
-    def do_GET(self):
+# --- Telegram через webhook ---
+TOKEN = os.environ["BOT_TOKEN"]
+SECRET = hashlib.sha256(TOKEN.encode()).hexdigest()[:32]
+
+
+def api(method, **data):
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TOKEN}/{method}",
+        json.dumps(data).encode(), {"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=20).read()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _ok(self, body=b"KentiAi 1 Lucky OK"):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"KentiAi 1 Lucky OK")
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._ok()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(size)
+        if self.path == "/hook" and self.headers.get("X-Telegram-Bot-Api-Secret-Token") == SECRET:
+            try:
+                msg = json.loads(body).get("message") or {}
+                text = msg.get("text")
+                if text:
+                    if text.startswith("/start"):
+                        answer = "Привет! Я KentiAi 1 Lucky 🍀 Напиши что-нибудь, я отвечу (иногда странно)."
+                    else:
+                        answer = say(text[:200]) or "..."
+                    api("sendMessage", chat_id=msg["chat"]["id"], text=answer,
+                        reply_to_message_id=msg["message_id"])
+            except Exception as e:
+                print("ошибка обработки:", repr(e))
+        self._ok(b"ok")
 
     def log_message(self, *args):
         pass
 
 
-port = int(os.environ.get("PORT", 8000))
-threading.Thread(
-    target=lambda: HTTPServer(("0.0.0.0", port), Health).serve_forever(),
-    daemon=True).start()
-
-# --- Telegram ---
-bot = telebot.TeleBot(os.environ["BOT_TOKEN"])
-
-
-@bot.message_handler(commands=["start"])
-def start(m):
-    bot.reply_to(m, "Привет! Я KentiAi 1 Lucky 🍀 Напиши мне что-нибудь, я отвечу (иногда странно).")
+def set_webhook():
+    url = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        print("нет адреса сервиса (RENDER_EXTERNAL_URL), webhook не установлен")
+        return
+    try:
+        api("setWebhook", url=url.rstrip("/") + "/hook", secret_token=SECRET)
+        print("webhook установлен:", url)
+    except Exception as e:
+        print("не удалось поставить webhook:", repr(e))
 
 
-@bot.message_handler(content_types=["text"])
-def chat(m):
-    bot.reply_to(m, say(m.text[:200]) or "...")
-
-
+threading.Thread(target=set_webhook, daemon=True).start()
 print("KentiAi 1 Lucky в сети")
-bot.infinity_polling(skip_pending=True)
+ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), Handler).serve_forever()
