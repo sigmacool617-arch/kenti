@@ -1,14 +1,20 @@
-import os, json, hashlib, threading, urllib.request
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+import io, glob, json, hashlib, threading, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 from tokenizers import Tokenizer
 
-# --- модель: чистый numpy, без PyTorch (те же размеры, что при обучении) ---
-V, D, L, H, T = 6000, 256, 4, 4, 64
-tok = Tokenizer.from_file("kenti_tokenizer.json")
-W = {k: v.astype(np.float32) for k, v in np.load("kenti.npz").items()}
+# --- модель KentiAi 2 Lucky: чистый numpy (размеры как при обучении) ---
+V, D, L, H, T = 8000, 512, 6, 8, 64
+tok = Tokenizer.from_file("kenti2_tokenizer.json")
+raw = b"".join(open(p, "rb").read() for p in sorted(glob.glob("kenti2_part*.bin")))
+W = {k: v.astype(np.float32) for k, v in np.load(io.BytesIO(raw)).items()}
+del raw
 eos = tok.token_to_id("<eos>")
 rng = np.random.default_rng()
+LOCK = threading.Lock()
 
 
 def layer_norm(x, w, b):
@@ -17,12 +23,13 @@ def layer_norm(x, w, b):
     return (x - m) / np.sqrt(v + 1e-5) * w + b
 
 
-def forward(ids):
-    """Возвращает логиты следующего токена."""
-    n = len(ids)
+def forward(new_ids, cache):
+    """Прогоняет новые токены, дописывает K/V в cache, возвращает логиты последнего токена."""
+    n = len(new_ids)
+    past = 0 if cache[0] is None else cache[0][0].shape[1]
     hd = D // H
-    x = W["emb.weight"][ids] + W["pos.weight"][:n]
-    mask = np.triu(np.full((n, n), -1e9, dtype=np.float32), 1)
+    x = W["emb.weight"][new_ids] + W["pos.weight"][past:past + n]
+    mask = np.triu(np.full((n, past + n), -1e9, dtype=np.float32), past + 1)
     for i in range(L):
         p = f"enc.layers.{i}."
         h = layer_norm(x, W[p + "norm1.weight"], W[p + "norm1.bias"])
@@ -31,6 +38,10 @@ def forward(ids):
         q = q.reshape(n, H, hd).transpose(1, 0, 2)
         k = k.reshape(n, H, hd).transpose(1, 0, 2)
         v = v.reshape(n, H, hd).transpose(1, 0, 2)
+        if cache[i] is not None:
+            k = np.concatenate([cache[i][0], k], axis=1)
+            v = np.concatenate([cache[i][1], v], axis=1)
+        cache[i] = (k, v)
         s = q @ k.transpose(0, 2, 1) / np.sqrt(hd) + mask
         s = np.exp(s - s.max(-1, keepdims=True))
         s /= s.sum(-1, keepdims=True)
@@ -45,17 +56,20 @@ def forward(ids):
 
 def say(q, max_new=30, temp=0.7, k=40):
     start = tok.encode(q.lower().strip() + "<sep>").ids[-40:]
-    ids = list(start)
-    for _ in range(max_new):
-        lg = forward(ids[-T:]) / temp
+    cache = [None] * L
+    lg = forward(start, cache)
+    out = []
+    for _ in range(min(max_new, T - len(start))):
+        lg = lg / temp
         top = np.argpartition(lg, -k)[-k:]
         p = np.exp(lg[top] - lg[top].max())
         p /= p.sum()
         nxt = int(rng.choice(top, p=p))
         if nxt == eos:
             break
-        ids.append(nxt)
-    return tok.decode(ids[len(start):], skip_special_tokens=True).strip()
+        out.append(nxt)
+        lg = forward([nxt], cache)
+    return tok.decode(out, skip_special_tokens=True).strip()
 
 
 # --- Telegram через webhook ---
@@ -70,8 +84,22 @@ def api(method, **data):
     return urllib.request.urlopen(req, timeout=20).read()
 
 
+def answer(msg):
+    try:
+        text = msg["text"]
+        if text.startswith("/start"):
+            reply = "Привет! Я KentiAi 2 Lucky 🍀 Напиши что-нибудь, я отвечу (иногда странно)."
+        else:
+            with LOCK:
+                reply = say(text[:200]) or "..."
+        api("sendMessage", chat_id=msg["chat"]["id"], text=reply,
+            reply_to_message_id=msg["message_id"])
+    except Exception as e:
+        print("ошибка ответа:", repr(e))
+
+
 class Handler(BaseHTTPRequestHandler):
-    def _ok(self, body=b"KentiAi 1 Lucky OK"):
+    def _ok(self, body=b"KentiAi 2 Lucky OK"):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(body)
@@ -89,17 +117,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/hook" and self.headers.get("X-Telegram-Bot-Api-Secret-Token") == SECRET:
             try:
                 msg = json.loads(body).get("message") or {}
-                text = msg.get("text")
-                if text:
-                    if text.startswith("/start"):
-                        answer = "Привет! Я KentiAi 1 Lucky 🍀 Напиши что-нибудь, я отвечу (иногда странно)."
-                    else:
-                        answer = say(text[:200]) or "..."
-                    api("sendMessage", chat_id=msg["chat"]["id"], text=answer,
-                        reply_to_message_id=msg["message_id"])
+                if msg.get("text"):
+                    threading.Thread(target=answer, args=(msg,), daemon=True).start()
             except Exception as e:
-                print("ошибка обработки:", repr(e))
-        self._ok(b"ok")
+                print("ошибка разбора:", repr(e))
+        self._ok(b"ok")  # отвечаем Telegram сразу, чтобы он не повторял запрос
 
     def log_message(self, *args):
         pass
@@ -118,5 +140,5 @@ def set_webhook():
 
 
 threading.Thread(target=set_webhook, daemon=True).start()
-print("KentiAi 1 Lucky в сети")
+print("KentiAi 2 Lucky в сети")
 ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), Handler).serve_forever()
